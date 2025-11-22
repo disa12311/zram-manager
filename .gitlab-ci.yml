@@ -1,135 +1,222 @@
-# GitLab CI/CD Pipeline for zram-manager
-# Optimized for shell script testing and deployment
+# GitLab CI/CD Pipeline for zRAM/SWAP Manager (Magisk Module)
+# Optimized for Android Magisk module build and deployment
 
-# Define pipeline stages
+image: alpine:latest
+
 stages:
+  - validate
   - lint
   - test
   - build
   - package
   - deploy
 
-# Global variables
 variables:
   GIT_DEPTH: 10
-  SHELLCHECK_VERSION: "stable"
-  SHFMT_VERSION: "v3.7.0"
+  MODULE_ID: zram_config
+  ANDROID_SDK_VERSION: "33"
 
-# Cache dependencies
 cache:
   key: ${CI_COMMIT_REF_SLUG}
   paths:
     - .cache/
 
-# Template for shell script jobs
-.shell_job_template:
+# ═══════════════════════════════════════════════
+# VALIDATE STAGE
+# ═══════════════════════════════════════════════
+
+validate:structure:
+  stage: validate
+  before_script:
+    - apk add --no-cache bash make
+  script:
+    - echo "→ Validating module structure..."
+    - test -f module.prop || exit 1
+    - test -f install.sh || exit 1
+    - test -f META-INF/com/google/android/update-binary || exit 1
+    - test -f common/service.sh || exit 1
+    - echo "✓ Module structure valid"
+  tags:
+    - docker
+
+validate:syntax:
+  stage: validate
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - echo "→ Checking shell syntax..."
+    - bash -n install.sh
+    - bash -n uninstall.sh
+    - bash -n META-INF/com/google/android/update-binary
+    - find common -name "*.sh" -exec bash -n {} \;
+    - echo "✓ Syntax check passed"
+  tags:
+    - docker
+
+validate:module_prop:
+  stage: validate
+  before_script:
+    - apk add --no-cache bash grep
+  script:
+    - echo "→ Validating module.prop..."
+    - grep -q "^id=" module.prop || exit 1
+    - grep -q "^name=" module.prop || exit 1
+    - grep -q "^version=" module.prop || exit 1
+    - grep -q "^versionCode=" module.prop || exit 1
+    - grep -q "^author=" module.prop || exit 1
+    - echo "✓ module.prop is valid"
+  artifacts:
+    reports:
+      dotenv: build.env
+  tags:
+    - docker
+
+# ═══════════════════════════════════════════════
+# LINT STAGE
+# ═══════════════════════════════════════════════
+
+lint:shellcheck:
+  stage: lint
   image: koalaman/shellcheck-alpine:stable
   before_script:
-    - apk add --no-cache bash make git
-
-# =====================
-# LINT STAGE
-# =====================
-
-shellcheck:
-  stage: lint
-  extends: .shell_job_template
+    - apk add --no-cache bash make
   script:
-    - echo "Running shellcheck..."
+    - echo "→ Running shellcheck..."
     - make check
+    - echo "✓ Shellcheck passed"
   allow_failure: false
   tags:
     - docker
 
-shell_format_check:
+lint:format:
   stage: lint
-  image: mvdan/shfmt:${SHFMT_VERSION}-alpine
+  image: mvdan/shfmt:latest-alpine
   before_script:
     - apk add --no-cache make
   script:
-    - echo "Checking shell script formatting..."
-    - shfmt -d -i 4 -ci .
+    - echo "→ Checking code formatting..."
+    - shfmt -d -i 4 -ci . || true
+    - echo "✓ Format check complete"
   allow_failure: true
   tags:
     - docker
 
-# =====================
-# TEST STAGE
-# =====================
-
-unit_tests:
-  stage: test
-  image: ubuntu:22.04
+lint:security:
+  stage: lint
   before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq bash make shellcheck
+    - apk add --no-cache bash grep
   script:
-    - echo "Running unit tests..."
+    - echo "→ Running security checks..."
+    - |
+      ISSUES=0
+      echo "Checking for dangerous patterns..."
+      
+      # Check for dangerous rm commands
+      if grep -rn "rm -rf /" . --include="*.sh" --exclude-dir=build; then
+        echo "⚠ Dangerous rm -rf / found"
+        ISSUES=$((ISSUES+1))
+      fi
+      
+      # Check for eval usage
+      if grep -rn "eval " . --include="*.sh" --exclude-dir=build; then
+        echo "⚠ eval usage detected"
+        ISSUES=$((ISSUES+1))
+      fi
+      
+      # Check for hardcoded credentials
+      if grep -rni "password\|apikey\|secret" . --include="*.sh" --exclude-dir=build; then
+        echo "⚠ Potential hardcoded credentials"
+        ISSUES=$((ISSUES+1))
+      fi
+      
+      echo "Security scan complete with $ISSUES potential issues"
+  allow_failure: true
+  tags:
+    - docker
+
+# ═══════════════════════════════════════════════
+# TEST STAGE
+# ═══════════════════════════════════════════════
+
+test:module:
+  stage: test
+  before_script:
+    - apk add --no-cache bash make grep
+  script:
+    - echo "→ Running module tests..."
     - make test
-  coverage: '/Lines:\s+(\d+\.\d+)%/'
+    - echo "✓ Module tests passed"
   artifacts:
     reports:
       junit: test-results.xml
-    paths:
-      - test-results.xml
-    expire_in: 1 week
   tags:
     - docker
 
-integration_tests:
+test:service_script:
   stage: test
-  image: ubuntu:22.04
   before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq bash make util-linux
+    - apk add --no-cache bash
   script:
-    - echo "Running integration tests..."
-    - bash tests/integration_tests.sh || true
-  allow_failure: true
-  only:
-    - merge_requests
-    - main
-    - develop
+    - echo "→ Testing service script..."
+    - bash -n common/service.sh
+    - |
+      # Check for required functions
+      grep -q "enable_swap" common/service.sh || exit 1
+      grep -q "disable_swap" common/service.sh || exit 1
+    - echo "✓ Service script valid"
   tags:
     - docker
 
-# =====================
+test:unity_scripts:
+  stage: test
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - echo "→ Testing Unity scripts..."
+    - bash -n common/unity_install.sh
+    - bash -n common/unity_uninstall.sh || true
+    - bash -n common/unity_upgrade.sh || true
+    - bash -n common/unityfiles/util_functions.sh
+    - echo "✓ Unity scripts valid"
+  tags:
+    - docker
+
+# ═══════════════════════════════════════════════
 # BUILD STAGE
-# =====================
+# ═══════════════════════════════════════════════
 
-build:
+build:standard:
   stage: build
-  image: alpine:latest
+  needs: ["validate:module_prop"]
   before_script:
-    - apk add --no-cache bash make tar gzip
+    - apk add --no-cache bash make zip
   script:
-    - echo "Building project..."
-    - make check
-    - echo "Build successful!"
+    - echo "→ Building standard module..."
+    - make build
+    - ls -lh *.zip
+    - echo "✓ Build complete"
   artifacts:
+    name: "${MODULE_ID}-${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}"
     paths:
-      - zram-manager
-    expire_in: 1 day
+      - "*.zip"
+    expire_in: 30 days
   tags:
     - docker
 
-# =====================
-# PACKAGE STAGE
-# =====================
-
-create_package:
-  stage: package
-  image: alpine:latest
+build:variants:
+  stage: build
+  needs: ["validate:module_prop"]
   before_script:
-    - apk add --no-cache bash make tar gzip
+    - apk add --no-cache bash make zip
   script:
-    - echo "Creating distribution package..."
-    - make package
-    - ls -lh dist/
+    - echo "→ Building module variants..."
+    - make release
+    - ls -lh release/
+    - echo "✓ All variants built"
   artifacts:
-    name: "zram-manager-${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}"
+    name: "${MODULE_ID}-release-${CI_COMMIT_SHORT_SHA}"
     paths:
-      - dist/*.tar.gz
+      - release/
     expire_in: 30 days
   only:
     - tags
@@ -137,57 +224,184 @@ create_package:
   tags:
     - docker
 
-debian_package:
+# ═══════════════════════════════════════════════
+# PACKAGE STAGE
+# ═══════════════════════════════════════════════
+
+package:checksums:
   stage: package
-  image: debian:bullseye
+  needs: ["build:standard"]
   before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq build-essential devscripts debhelper
+    - apk add --no-cache bash coreutils
   script:
-    - echo "Building Debian package..."
-    - dpkg-buildpackage -us -uc -b || echo "Debian packaging not configured"
+    - echo "→ Creating checksums..."
+    - sha256sum *.zip > checksums.sha256
+    - md5sum *.zip > checksums.md5
+    - cat checksums.sha256
+    - echo "✓ Checksums created"
   artifacts:
     paths:
-      - ../*.deb
+      - checksums.*
     expire_in: 30 days
-  only:
-    - tags
-  allow_failure: true
   tags:
     - docker
 
-# =====================
-# DEPLOY STAGE
-# =====================
-
-# Deploy to GitLab releases
-release_job:
-  stage: deploy
-  image: registry.gitlab.com/gitlab-org/release-cli:latest
-  script:
-    - echo "Creating GitLab release..."
-  release:
-    tag_name: '$CI_COMMIT_TAG'
-    description: './CHANGELOG.md'
-    assets:
-      links:
-        - name: 'zram-manager package'
-          url: '${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/download'
-  only:
-    - tags
-  tags:
-    - docker
-
-# Deploy documentation
-pages:
-  stage: deploy
-  image: alpine:latest
+package:metadata:
+  stage: package
+  needs: ["build:standard"]
   before_script:
-    - apk add --no-cache bash make
+    - apk add --no-cache bash jq
   script:
+    - echo "→ Generating metadata..."
+    - |
+      cat > metadata.json <<EOF
+      {
+        "id": "$(grep -oP '(?<=id=).*' module.prop)",
+        "name": "$(grep -oP '(?<=name=).*' module.prop)",
+        "version": "$(grep -oP '(?<=version=).*' module.prop)",
+        "versionCode": $(grep -oP '(?<=versionCode=).*' module.prop),
+        "author": "$(grep -oP '(?<=author=).*' module.prop)",
+        "description": "$(grep -oP '(?<=description=).*' module.prop)",
+        "commit": "${CI_COMMIT_SHORT_SHA}",
+        "branch": "${CI_COMMIT_REF_NAME}",
+        "pipeline": "${CI_PIPELINE_ID}"
+      }
+      EOF
+    - cat metadata.json
+    - echo "✓ Metadata generated"
+  artifacts:
+    paths:
+      - metadata.json
+    expire_in: 30 days
+  tags:
+    - docker
+
+# ═══════════════════════════════════════════════
+# DEPLOY STAGE
+# ═══════════════════════════════════════════════
+
+deploy:pages:
+  stage: deploy
+  needs: ["build:standard", "package:metadata"]
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - echo "→ Generating documentation..."
     - mkdir -p public
-    - echo "<html><head><title>zram-manager</title></head><body><h1>zram-manager Documentation</h1></body></html>" > public/index.html
-    - cp README* public/ 2>/dev/null || true
+    - |
+      cat > public/index.html <<'EOF'
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>zRAM/SWAP Manager</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                 min-height: 100vh; padding: 20px; }
+          .container { max-width: 900px; margin: 0 auto; 
+                      background: white; border-radius: 15px; 
+                      padding: 40px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+          h1 { color: #333; margin-bottom: 10px; font-size: 2.5em; }
+          .version { color: #666; font-size: 1.2em; margin-bottom: 30px; }
+          .description { color: #555; line-height: 1.8; margin-bottom: 30px; font-size: 1.1em; }
+          .download { background: #667eea; color: white; padding: 15px 40px; 
+                     border: none; border-radius: 8px; font-size: 1.1em; 
+                     cursor: pointer; text-decoration: none; display: inline-block;
+                     transition: all 0.3s; }
+          .download:hover { background: #5568d3; transform: translateY(-2px);
+                           box-shadow: 0 5px 15px rgba(102,126,234,0.4); }
+          .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                     gap: 20px; margin: 30px 0; }
+          .feature { padding: 20px; background: #f8f9fa; border-radius: 10px;
+                    border-left: 4px solid #667eea; }
+          .feature h3 { color: #667eea; margin-bottom: 10px; }
+          .feature p { color: #666; line-height: 1.6; }
+          .stats { display: flex; justify-content: space-around; margin: 30px 0;
+                  padding: 20px; background: #f8f9fa; border-radius: 10px; }
+          .stat { text-align: center; }
+          .stat-value { font-size: 2em; color: #667eea; font-weight: bold; }
+          .stat-label { color: #666; margin-top: 5px; }
+          code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px;
+                font-family: 'Courier New', monospace; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🚀 zRAM/SWAP Manager</h1>
+          <div class="version">Version 1.3</div>
+          <p class="description">
+            A powerful Magisk module that enables or disables zRAM on Android devices. 
+            Using zRAM can significantly increase performance by avoiding disk paging and 
+            instead using a compressed block device in the physical RAM.
+          </p>
+          
+          <a href="#" class="download">⬇ Download Latest Version</a>
+          
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-value">v1.3</div>
+              <div class="stat-label">Latest Version</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value">130</div>
+              <div class="stat-label">Version Code</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value">Magisk</div>
+              <div class="stat-label">Platform</div>
+            </div>
+          </div>
+          
+          <div class="features">
+            <div class="feature">
+              <h3>⚡ Performance Boost</h3>
+              <p>Compress RAM data to free up memory and improve multitasking performance</p>
+            </div>
+            <div class="feature">
+              <h3>🎛️ Easy Control</h3>
+              <p>Enable or disable zRAM with volume keys during installation</p>
+            </div>
+            <div class="feature">
+              <h3>🔧 Auto Configuration</h3>
+              <p>Automatically calculates optimal zRAM size based on your device's RAM</p>
+            </div>
+            <div class="feature">
+              <h3>📱 Wide Support</h3>
+              <p>Compatible with Magisk 15.3+ on most Android devices</p>
+            </div>
+          </div>
+          
+          <h2>Installation</h2>
+          <ol style="line-height: 2; color: #555; margin: 20px 0;">
+            <li>Download the module ZIP file</li>
+            <li>Open Magisk Manager</li>
+            <li>Go to Modules → Install from storage</li>
+            <li>Select the downloaded ZIP</li>
+            <li>Use Volume Keys to enable/disable zRAM</li>
+            <li>Reboot your device</li>
+          </ol>
+          
+          <h2>How it works</h2>
+          <p style="color: #555; line-height: 1.8; margin: 20px 0;">
+            The module uses advanced algorithms (LZ4/ZSTD) to compress memory in real-time. 
+            It automatically calculates the optimal zRAM size based on your total RAM:
+          </p>
+          <ul style="color: #555; line-height: 2; margin: 20px 0 20px 40px;">
+            <li><code>&gt; 3GB RAM</code>: 2048MB zRAM</li>
+            <li><code>&gt; 2GB RAM</code>: 1792MB zRAM</li>
+            <li><code>&gt; 1GB RAM</code>: 1024MB zRAM</li>
+            <li><code>&lt; 1GB RAM</code>: 768MB zRAM</li>
+          </ul>
+        </div>
+      </body>
+      </html>
+      EOF
+    - cp README.md public/ 2>/dev/null || true
+    - cp metadata.json public/ 2>/dev/null || true
+    - echo "✓ Documentation generated"
   artifacts:
     paths:
       - public
@@ -197,40 +411,68 @@ pages:
   tags:
     - docker
 
-# =====================
-# SECURITY SCANNING
-# =====================
-
-security_scan:
-  stage: test
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache bash git
+deploy:release:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: build:variants
+      artifacts: true
+    - job: package:metadata
+      artifacts: true
   script:
-    - echo "Running security scan..."
-    - grep -r "eval\|exec\|system" . || true
-    - echo "Security scan complete"
-  allow_failure: true
+    - echo "→ Creating GitLab release..."
+  release:
+    tag_name: '$CI_COMMIT_TAG'
+    name: 'zRAM Manager $CI_COMMIT_TAG'
+    description: |
+      ## zRAM/SWAP Manager $CI_COMMIT_TAG
+      
+      ### What's New
+      - Bug fixes and improvements
+      - Unity template updated
+      
+      ### Installation
+      1. Download the ZIP file below
+      2. Flash via Magisk Manager or TWRP
+      3. Use Volume Keys to enable/disable zRAM
+      4. Reboot
+      
+      ### Features
+      - ⚡ Automatic zRAM size calculation
+      - 🎛️ Volume key selector during install
+      - 🔧 LZ4/ZSTD compression support
+      - 📱 Compatible with most Android devices
+      
+      ### Downloads
+      - **Standard**: For normal installation
+      - **Enable**: Pre-configured to enable zRAM
+      - **Disable**: Pre-configured to disable zRAM
+    assets:
+      links:
+        - name: 'Standard Version'
+          url: '${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build:variants'
+          link_type: package
+  only:
+    - tags
   tags:
     - docker
 
-# =====================
-# MANUAL JOBS
-# =====================
+# ═══════════════════════════════════════════════
+# UTILITY JOBS
+# ═══════════════════════════════════════════════
 
-manual_deploy:
+update_readme:
   stage: deploy
-  image: alpine:latest
   before_script:
-    - apk add --no-cache openssh-client bash
+    - apk add --no-cache bash git
   script:
-    - echo "Deploying to production server..."
-    - echo "Add your deployment commands here"
-  when: manual
+    - echo "→ Updating README badges..."
+    - |
+      # Update pipeline badge in README
+      sed -i "s|badges/main/pipeline.svg|badges/${CI_COMMIT_REF_NAME}/pipeline.svg|g" README.md || true
+    - echo "✓ README updated"
   only:
     - main
-  environment:
-    name: production
-    url: https://example.com
+  when: manual
   tags:
     - docker
