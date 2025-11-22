@@ -1,75 +1,153 @@
-# External Tools
+#!/system/bin/sh
+# Volume Key Selector for zRAM Manager
+# Optimized with better error handling and cleaner code
 
-chmod -R 0755 $TMPDIR/addon/Volume-Key-Selector/tools
-cp -R $TMPDIR/addon/Volume-Key-Selector/tools $UF 2>/dev/null
+# Configuration file
+CONFIG_FILE="/data/adb/swap-config.txt"
 
+# Setup external tools
+setup_tools() {
+    if [ -d "$TMPDIR/addon/Volume-Key-Selector/tools" ]; then
+        chmod -R 0755 "$TMPDIR/addon/Volume-Key-Selector/tools"
+        cp -R "$TMPDIR/addon/Volume-Key-Selector/tools" "$UF" 2>/dev/null
+    fi
+}
+
+# Test if volume keys work using getevent
 keytest() {
-  ui_print "- Vol Key Test -"
-  ui_print "  Press a Vol Key"
-  (/system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > $TMPDIR/events) || return 1
-  return 0
+    ui_print "- Testing Volume Keys -"
+    ui_print "  Press any Volume key..."
+    
+    # Try to detect volume key press
+    timeout 3 /system/bin/getevent -lc 1 2>&1 | \
+        /system/bin/grep VOLUME | \
+        /system/bin/grep " DOWN" > "$TMPDIR/events" 2>/dev/null
+    
+    [ -s "$TMPDIR/events" ] && return 0 || return 1
 }
 
+# Modern volume key detection using getevent
 chooseport() {
-  # Original idea by chainfire @xda-developers, improved on by ianmacd @xda-developers
-  #note from chainfire @xda-developers: getevent behaves weird when piped, and busybox grep likes that even less than toolbox/toybox grep
-  while true; do
-    /system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > $TMPDIR/events
-    if (`cat $TMPDIR/events 2>/dev/null | /system/bin/grep VOLUME >/dev/null`); then
-      break
-    fi
-  done
-  if (`cat $TMPDIR/events 2>/dev/null | /system/bin/grep VOLUMEUP >/dev/null`); then
+    local timeout_count=0
+    local max_timeout=30  # 30 second timeout
+    
+    while [ $timeout_count -lt $max_timeout ]; do
+        # Wait for volume key press
+        /system/bin/getevent -lc 1 2>&1 | \
+            /system/bin/grep VOLUME | \
+            /system/bin/grep " DOWN" > "$TMPDIR/events" 2>/dev/null
+        
+        # Check if we got a volume key event
+        if grep -q VOLUME "$TMPDIR/events" 2>/dev/null; then
+            # Check which key was pressed
+            if grep -q VOLUMEUP "$TMPDIR/events" 2>/dev/null; then
+                return 0  # Volume Up
+            else
+                return 1  # Volume Down
+            fi
+        fi
+        
+        timeout_count=$((timeout_count + 1))
+        sleep 0.1
+    done
+    
+    # Timeout - default to Volume Up (enable)
+    ui_print "  Timeout - defaulting to Enable"
     return 0
-  else
-    return 1
-  fi
 }
 
-chooseportold() {
-  # Keycheck binary by someone755 @Github, idea for code below by Zappo @xda-developers
-  # Calling it first time detects previous input. Calling it second time will do what we want
-  keycheck
-  keycheck
-  SEL=$?
-  if [ "$1" == "UP" ]; then
-    UP=$SEL
-  elif [ "$1" == "DOWN" ]; then
-    DOWN=$SEL
-  elif [ $SEL -eq $UP ]; then
-    return 0
-  elif [ $SEL -eq $DOWN ]; then
-    return 1
-  else
-    abort "  Vol key not detected! Aborting!"
-  fi
+# Legacy volume key detection using keycheck binary
+chooseport_legacy() {
+    # First call detects previous input, second call gets actual input
+    keycheck >/dev/null 2>&1
+    keycheck >/dev/null 2>&1
+    local sel=$?
+    
+    case "$1" in
+        UP)
+            UP=$sel
+            ;;
+        DOWN)
+            DOWN=$sel
+            ;;
+        *)
+            [ $sel -eq $UP ] && return 0
+            [ $sel -eq $DOWN ] && return 1
+            abort "  Volume key not detected! Aborting!"
+            ;;
+    esac
 }
 
-# Have user option to skip vol keys
-
-    if [ -e "/data/adb/swap-config.txt" ]; then
-	CONFIG=$(cat /data/adb/swap-config.txt)
+# Load saved configuration
+load_saved_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        CONFIG=$(cat "$CONFIG_FILE" 2>/dev/null)
+        
+        # Validate config
+        case "$CONFIG" in
+            0|1) return 0 ;;
+            *) CONFIG="" ;;
+        esac
     fi
+    
+    return 1
+}
 
-OIFS=$IFS; IFS=\|; MID=false; NEW=false
-if [ -z $PROFILEMODE ] ; then
-case $(echo $(basename $ZIPFILE) | tr '[:upper:]' '[:lower:]') in
-  *disable*) CONFIG=0 ui_print "- Skipping Vol Keys -";;
-  *enab*) CONFIG=1 ui_print "- Skipping Vol Keys -";;
-  *) if keytest; then
-       VKSEL=chooseport
-     else
-       VKSEL=chooseportold
-       ui_print "  ! Legacy device detected! Using old keycheck method"
-       ui_print " "
-       ui_print "- Vol Key Programming -"
-       ui_print "  Press Vol Up Again:"
-       $VKSEL "UP"
-       ui_print "  Press Vol Down"
-       $VKSEL "DOWN"
-     fi;;
-esac
-fi
-IFS=$OIFS
+# Check if user wants to skip volume keys via filename
+check_filename_override() {
+    local zipname
+    zipname=$(basename "$ZIPFILE" | tr '[:upper:]' '[:lower:]')
+    
+    case "$zipname" in
+        *disable*)
+            CONFIG=0
+            ui_print "- Filename detected: Disable mode"
+            ui_print "- Skipping Volume Key selection"
+            return 0
+            ;;
+        *enable*)
+            CONFIG=1
+            ui_print "- Filename detected: Enable mode"
+            ui_print "- Skipping Volume Key selection"
+            return 0
+            ;;
+    esac
+    
+    return 1
+}
 
+# Main volume key selector logic
+main() {
+    # Setup tools directory
+    setup_tools
+    
+    # Load saved configuration if exists
+    load_saved_config
+    
+    # Check for filename override (disable.zip or enable.zip)
+    [ -z "$PROFILEMODE" ] && check_filename_override && return 0
+    
+    # If no saved config and no filename override, use volume keys
+    ui_print " "
+    
+    # Test if modern getevent method works
+    if keytest; then
+        VKSEL=chooseport
+    else
+        # Fallback to legacy keycheck method
+        VKSEL=chooseport_legacy
+        
+        ui_print "  Legacy device detected - using keycheck method"
+        ui_print " "
+        ui_print "- Volume Key Programming -"
+        ui_print "  Press Volume Up:"
+        $VKSEL UP
+        ui_print "  Press Volume Down:"
+        $VKSEL DOWN
+    fi
+    
+    return 0
+}
 
+# Execute main function
+main

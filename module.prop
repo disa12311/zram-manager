@@ -1,9 +1,11 @@
 id=zram_config
 name=zRAM/SWAP Manager
-version=v1.3
-versionCode=130
+version=v1.4
+versionCode=140
 author=korom42
-description=A simple module that enables or disables zRam. Using zRam can increase performance by avoiding disk paging and instead using a compressed block device in the physical RAM.
+description=Optimized zRAM manager for Android. Enables compressed RAM swap to boost multitasking performance. Features: Smart size calculation, LZ4/ZSTD compression, automatic fallback, volume key selector. Compatible with Android 5.0+ and Magisk 15.3+.
 support=https://forum.xda-developers.com/apps/magisk/xz-lxt-1-0-insane-battery-life-12h-sot-t3700688
+donate=https://paypal.me/korom42
+updateJson=https://raw.githubusercontent.com/korom42/zram-manager/main/update.json
 minMagisk=1530
-
+minApi=21
